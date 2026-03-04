@@ -91,7 +91,7 @@ def hms_str_to_fraction(hms_str):
         parts = str(hms_str).strip().split(":")
         if len(parts) != 3: return None
         h,m,s = int(parts[0]),int(parts[1]),int(parts[2])
-        return (h*3600 + m*60 + s) / 86400
+        return (h*3600 + m*60) / 86400
     except: return None
 
 
