@@ -47,7 +47,7 @@ def sec_to_hms_series(sec_series):
     h  = (total // 3600).astype(str).str.zfill(2)
     m  = ((total % 3600) // 60).astype(str).str.zfill(2)
     sc = (total % 60).astype(str).str.zfill(2)
-    result = h + ":" + m + ":" + sc
+    result = h + ":" + m 
     return result.where(mask, "")
 
 
@@ -118,8 +118,7 @@ def min_to_hms(m):
     total_sec = int(m * 60)
     h  = total_sec // 3600
     mn = (total_sec % 3600) // 60
-    s  = total_sec % 60
-    return f"{h:02d}:{mn:02d}:{s:02d}"
+    return f"{h:02d}:{mn:02d}"
 
 
 # ─────────────────────────────────────────────
