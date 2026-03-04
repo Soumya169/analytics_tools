@@ -217,34 +217,72 @@ def build_excel_multi(sheets_dict, tat_cols_set=None, dt_col_names=None):
                     14 if cn in tat_cols_set else
                     22 if cn in dt_col_names else 20)
 
-            # Data rows
+            # Data rows — safe write with full NaN/NaT/numpy type handling
+            def safe_num(v):
+                """Convert to plain Python float, return None if invalid."""
+                try:
+                    if v is None: return None
+                    if pd.isnull(v): return None
+                    return float(v)
+                except Exception:
+                    return None
+
+            def safe_val(v):
+                """Convert to plain Python scalar, return None if NaN/NaT."""
+                try:
+                    if v is None: return None
+                    if pd.isnull(v): return None
+                    # Convert numpy scalars to Python natives
+                    if hasattr(v, 'item'): return v.item()
+                    return v
+                except Exception:
+                    return v
+
             data_values = df.values.tolist()
             for ri, row_data in enumerate(data_values):
-                rn = ri + 1
+                rn   = ri + 1
                 base = fmt_even if rn % 2 == 0 else fmt_odd
                 for ci, cn in enumerate(col_names):
                     val = row_data[ci]
+
                     if cn in tat_cols_set:
-                        # Convert HH:MM string to fraction if needed
-                        if isinstance(val, str) and ":" in str(val):
+                        # HH:MM string → fraction, or already a fraction number
+                        if isinstance(val, str) and ":" in val:
                             mins = hms_to_min(val)
-                            val  = (mins * 60 / 86400) if mins is not None else None
-                        ws.write(rn, ci, val, fmt_tat_even)
+                            num  = (mins * 60 / 86400) if mins is not None else None
+                        else:
+                            num = safe_num(val)
+                        if num is None:
+                            ws.write_blank(rn, ci, None, fmt_tat_even)
+                        else:
+                            ws.write_number(rn, ci, num, fmt_tat_even)
+
                     elif is_stats and cn in TIME_STAT_COLS:
-                        if isinstance(val, str) and ":" in str(val):
+                        if isinstance(val, str) and ":" in val:
                             mins = hms_to_min(val)
-                            val  = (mins * 60 / 86400) if mins is not None else None
-                        ws.write(rn, ci, val, fmt_time_val)
+                            num  = (mins * 60 / 86400) if mins is not None else None
+                        elif isinstance(val, str) and val in ("", "–"):
+                            num = None
+                        else:
+                            num = safe_num(val)
+                        if num is None:
+                            ws.write_blank(rn, ci, None, fmt_time_val)
+                        else:
+                            ws.write_number(rn, ci, num, fmt_time_val)
+
                     elif cn in dt_col_names:
-                        # Convert NaT/NaN to None — xlsxwriter cannot handle NaT
-                        try:
-                            if val is None or pd.isnull(val):
-                                val = None
-                        except Exception:
-                            pass
-                        ws.write(rn, ci, val, fmt_dt)
+                        v = safe_val(val)
+                        if v is None:
+                            ws.write_blank(rn, ci, None, fmt_dt)
+                        else:
+                            ws.write(rn, ci, v, fmt_dt)
+
                     else:
-                        ws.write(rn, ci, val, base)
+                        v = safe_val(val)
+                        if v is None:
+                            ws.write_blank(rn, ci, None, base)
+                        else:
+                            ws.write(rn, ci, v, base)
 
             ws.freeze_panes(1, 0)
 
