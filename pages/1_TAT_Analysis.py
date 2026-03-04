@@ -129,8 +129,33 @@ def build_groupby_stats(result_json, tat_cols_tuple, group_col):
                          "Trip Count":int(r["cnt"])})
     return pd.DataFrame(rows)
 
-
-
+@st.cache_data(show_spinner=False)
+def build_time_dimension(result_json, tat_cols_tuple, group_col, sort_order_tuple=None):
+    result     = pd.read_json(io.StringIO(result_json))
+    tat_cols   = list(tat_cols_tuple)
+    sort_order = list(sort_order_tuple) if sort_order_tuple else None
+    if group_col not in result.columns: return pd.DataFrame()
+    min_cols = {}
+    for col in tat_cols:
+        if col in result.columns:
+            min_cols[col+"_min"] = hms_to_min_series(result[col])
+    tmp = pd.concat([result[[group_col]], pd.DataFrame(min_cols, index=result.index)], axis=1)
+    rows = []
+    for col in tat_cols:
+        mc = col+"_min"
+        if mc not in tmp.columns: continue
+        agg = tmp.groupby(group_col)[mc].agg(["mean","median","min","max","count"]).reset_index()
+        agg.columns = [group_col,"avg","med","mn","mx","cnt"]
+        if sort_order:
+            order_map = {k:i for i,k in enumerate(sort_order)}
+            agg["_ord"] = agg[group_col].map(lambda x: order_map.get(str(x), 999))
+            agg = agg.sort_values("_ord").drop(columns=["_ord"])
+        for _, r in agg.iterrows():
+            rows.append({group_col:str(r[group_col]),"TAT Stage":col,
+                         "Trip Count":int(r["cnt"]),
+                         "Average":min_to_hms(r["avg"]),"Median":min_to_hms(r["med"]),
+                         "Min":min_to_hms(r["mn"]),"Max":min_to_hms(r["mx"])})
+    return pd.DataFrame(rows)
 
 
 def make_pivot(df, index_col, tat_cols, metric="Average"):
@@ -546,22 +571,6 @@ def save_and_rerun(result, tat_cols_set, dt_col_names, sel_cat, total_rows, gate
             # Clean NaT
             for c in ["GateOut Date","GateOut DayOfWeek","GateOut WeekNo","GateOut Month"]:
                 result[c] = result[c].replace("NaT","")
-
-    # ── BUILD TIME DIMENSION STATS ────────────────────────────
-    time_data = {}
-    if "GateOut Date" in result.columns:
-        time_data["date_df"] = build_time_dimension(
-            result, tat_cols, "GateOut Date")
-    if "GateOut DayOfWeek" in result.columns:
-        time_data["dayofwk_df"] = build_time_dimension(
-            result, tat_cols, "GateOut DayOfWeek", sort_order=WEEKDAY_ORDER)
-    if "GateOut WeekNo" in result.columns:
-        all_weeks = sorted(result["GateOut WeekNo"].unique().tolist())
-        time_data["week_df"] = build_time_dimension(
-            result, tat_cols, "GateOut WeekNo", sort_order=all_weeks)
-    if "GateOut Month" in result.columns:
-        time_data["month_df"] = build_time_dimension(
-            result, tat_cols, "GateOut Month", sort_order=MONTH_ORDER)
 
     # Serialize to JSON once — cached functions reuse it
     with st.spinner("⚙️ Computing statistics..."):
