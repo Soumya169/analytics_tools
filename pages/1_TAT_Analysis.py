@@ -2,13 +2,53 @@ import streamlit as st
 import pandas as pd
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from utils import load_file, to_dt, auto_index, parse_summary, calculate_stages, hms_to_min, min_to_hms
+from utils import load_file, to_dt, auto_index, parse_summary, calculate_stages, hms_to_min, min_to_hms, hms_to_min_series, hms_to_excel_fraction_series
 import io
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="TAT Analysis", page_icon="📥", layout="wide")
 
+st.set_page_config(page_title="TAT Analysis", page_icon="📥", layout="wide")
+
+# ── TOP RIGHT TEMPLATE BUTTONS ─────────────────────────────
+_, col_ib, col_ob = st.columns([6, 1, 1])
+with col_ib:
+    ib_headers = ["Trip ID","Vehicle Number","Transporter Name","Shift",
+                  "Gate Entry Type","Supplier Name","Mat. Group","YardIn",
+                  "GateIn","GrossWeight","TareWeight","GateOut","Net Weight","Remarks"]
+    ib_buf = io.BytesIO()
+    with pd.ExcelWriter(ib_buf, engine='xlsxwriter') as w:
+        pd.DataFrame(columns=ib_headers).to_excel(w, index=False, sheet_name="IB Template")
+        fmt = w.book.add_format({'bold':True,'font_color':'#FFFFFF','bg_color':'#1F4E79','align':'center','border':1})
+        ws  = w.sheets["IB Template"]
+        for i,h in enumerate(ib_headers):
+            ws.write(0,i,h,fmt)
+            ws.set_column(i,i,18)
+    ib_buf.seek(0)
+    st.download_button("📥 IB Template", data=ib_buf,
+        file_name="IB_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="ib_tmpl_top", use_container_width=True)
+
+with col_ob:
+    ob_headers = ["Trip ID","Vehicle Number","Transporter Name","Shift",
+                  "Gate Entry Type","Supplier Name","Mat. Group","YardIn","ParkIn",
+                  "YardOut","ParkOut","GateIn","GrossWeight","LoadingIn","LoadingOut",
+                  "TareWeight","GateOut","Unloader Alias","Net Weight","Remarks"]
+    ob_buf = io.BytesIO()
+    with pd.ExcelWriter(ob_buf, engine='xlsxwriter') as w:
+        pd.DataFrame(columns=ob_headers).to_excel(w, index=False, sheet_name="OB Template")
+        fmt = w.book.add_format({'bold':True,'font_color':'#FFFFFF','bg_color':'#833C00','align':'center','border':1})
+        ws  = w.sheets["OB Template"]
+        for i,h in enumerate(ob_headers):
+            ws.write(0,i,h,fmt)
+            ws.set_column(i,i,18)
+    ob_buf.seek(0)
+    st.download_button("📤 OB Template", data=ob_buf,
+        file_name="OB_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="ob_tmpl_top", use_container_width=True)
 st.title("📥📤 TAT Analysis")
 st.markdown("Calculate TAT for **Inbound** and **Outbound** trips in `HH:MM:SS` format.")
 st.markdown("---")
@@ -59,7 +99,7 @@ def build_stats_table(result, tat_cols):
     rows = []
     for col in tat_cols:
         if col not in result.columns: continue
-        mins = result[col].apply(hms_to_min).dropna()
+        mins = hms_to_min_series(result[col]).dropna()   # vectorized
         if len(mins) == 0: continue
         rows.append({
             "TAT Stage":  col,
@@ -79,7 +119,7 @@ def build_groupby_stats(result, tat_cols, group_col):
     tmp = result.copy()
     for col in tat_cols:
         if col in tmp.columns:
-            tmp[col+"_min"] = tmp[col].apply(hms_to_min)
+            tmp[col+"_min"] = hms_to_min_series(tmp[col])   # vectorized
     for col in tat_cols:
         mc = col+"_min"
         if mc not in tmp.columns: continue
@@ -99,7 +139,7 @@ def build_time_dimension(result, tat_cols, group_col, sort_order=None):
     tmp = result.copy()
     for col in tat_cols:
         if col in tmp.columns:
-            tmp[col+"_min"] = tmp[col].apply(hms_to_min)
+            tmp[col+"_min"] = hms_to_min_series(tmp[col])   # vectorized
     for col in tat_cols:
         mc = col+"_min"
         if mc not in tmp.columns: continue
@@ -230,10 +270,21 @@ def style_sheet(ws, header_color):
 
 
 def export_excel(result, stats_df, groupby_df, time_data, dt_col_names, tat_cols_set):
+    # ── Pre-convert before writing (avoid cell-by-cell loops) ──
+    result_out = result.copy()
+    for col in tat_cols_set:
+        if col in result_out.columns:
+            result_out[col] = hms_to_excel_fraction_series(result_out[col])
+    for col in dt_col_names:
+        if col in result_out.columns:
+            result_out[col] = pd.to_datetime(
+                result_out[col].replace("", pd.NaT), dayfirst=True, errors='coerce'
+            ).dt.to_pydatetime()
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         # ── Write all sheets ──────────────────────────────────
-        result.to_excel(writer, index=False, sheet_name="Full Data")
+        result_out.to_excel(writer, index=False, sheet_name="Full Data")
         if not stats_df.empty:
             stats_df.to_excel(writer, index=False, sheet_name="Overall Stats")
         if not groupby_df.empty:
@@ -267,32 +318,26 @@ def export_excel(result, stats_df, groupby_df, time_data, dt_col_names, tat_cols
         # ── Fix Full Data sheet formats ───────────────────────
         ws_full = writer.sheets["Full Data"]
         col_letter_map = {col: get_column_letter(idx)
-                          for idx, col in enumerate(result.columns, 1)}
+                          for idx, col in enumerate(result_out.columns, 1)}
 
-        # Datetime columns → DD-MM-YYYY HH:MM:SS
+        # Datetime columns → already converted, just set format
         for col_name in dt_col_names:
             if col_name in col_letter_map:
                 cl = col_letter_map[col_name]
-                for rn in range(2, len(result)+2):
+                for rn in range(2, len(result_out)+2):
                     cell = ws_full[f"{cl}{rn}"]
-                    if isinstance(cell.value, str) and cell.value != "":
-                        try: cell.value = pd.to_datetime(cell.value, dayfirst=True).to_pydatetime()
-                        except: pass
                     if cell.value and not isinstance(cell.value, str):
                         cell.number_format = "DD-MM-YYYY HH:MM:SS"
 
-        # TAT columns → real [HH]:MM:SS duration (green)
+        # TAT columns → already fractions, just apply format + style
         for col_name in tat_cols_set:
             if col_name in col_letter_map:
-                col_idx = result.columns.tolist().index(col_name)+1
+                col_idx = result_out.columns.tolist().index(col_name)+1
                 ws_full.cell(1, col_idx).fill = PatternFill("solid", start_color="375623")
                 ws_full.cell(1, col_idx).font = Font(name="Arial",size=10,bold=True,color="FFFFFF")
                 cl = get_column_letter(col_idx)
-                for rn in range(2, len(result)+2):
+                for rn in range(2, len(result_out)+2):
                     cell = ws_full[f"{cl}{rn}"]
-                    if isinstance(cell.value, str) and cell.value != "":
-                        frac = hms_str_to_fraction(cell.value)
-                        if frac is not None: cell.value = frac
                     if cell.value not in (None,""):
                         cell.number_format = "[HH]:MM:SS"
                     cell.fill = PatternFill("solid", start_color="E2EFDA")
@@ -311,7 +356,7 @@ def export_excel(result, stats_df, groupby_df, time_data, dt_col_names, tat_cols
                 cl = get_column_letter(col_idx)
                 ws_full.cell(1,col_idx).fill = PatternFill("solid",start_color=fg)
                 ws_full.cell(1,col_idx).font = Font(name="Arial",size=10,bold=True,color="FFFFFF")
-                for rn in range(2, len(result)+2):
+                for rn in range(2, len(result_out)+2):
                     cell = ws_full[f"{cl}{rn}"]
                     cell.fill = PatternFill("solid",start_color=bg)
                     cell.font = Font(name="Arial",size=9,bold=True,color=fg)
@@ -639,16 +684,29 @@ if mode == "inbound":
 # ═════════════════════════════════════════════════════════════
 else:
     st.subheader("📤 Outbound TAT")
-    st.markdown("**Process:** `GrossWeight → LoadingIn → LoadingOut → TareWeight → GateOut`")
+    st.markdown("**Process:** `YardIn* → YardOut* → GateIn → GrossWeight → LoadingIn → LoadingOut → TareWeight → GateOut`")
+    st.markdown("*(ParkIn/ParkOut used as fallback per row when YardIn/YardOut is blank)*")
     with st.expander("📖 Stage Reference"):
         st.markdown("""
+        **Full Process:** `YardIn → YardOut → GateIn → GrossWeight → LoadingIn → LoadingOut → TareWeight → GateOut`
+
+        > 💡 **ParkIn Fallback:** If YardIn is blank for a row, ParkIn value is used automatically for that row.
+        > Similarly if YardOut is blank, ParkOut is used.
+
         | TAT Column | Formula | Meaning |
         |---|---|---|
-        | GW-LI | LoadingIn − GrossWeight | Gross to Loading Start |
+        | YI-GI | GateIn − YardIn* | Yard/Park In to Gate In |
+        | YI-YO | YardOut* − YardIn* | Yard In to Yard Out |
+        | YO-GI | GateIn − YardOut* | Yard Out to Gate In |
+        | GI-GW | GrossWeight − GateIn | Gate In to Gross Weighment |
+        | GW-LI | LoadingIn − GrossWeight | Gross Weighment to Loading Start |
         | LI-LO | LoadingOut − LoadingIn | Loading Duration |
-        | LO-TW | TareWeight − LoadingOut | Loading End to Tare |
+        | LO-TW | TareWeight − LoadingOut | Loading End to Tare Weighment |
         | TW-GO | GateOut − TareWeight | Tare to Gate Out |
-        | GW-GO | GateOut − GrossWeight | Total Outbound Plant Time |
+        | GI-GO | GateOut − GateIn | Total Plant Time |
+        | GW-GO | GateOut − GrossWeight | Gross to Gate Out |
+
+        *(ParkIn used as YardIn fallback per row. ParkOut used as YardOut fallback per row.)*
         """)
     st.markdown("---")
 
@@ -668,20 +726,25 @@ else:
     st.markdown("---")
     st.subheader("🔧 Map Your Columns")
     all_cols = ["-- Not Available --"] + df.columns.tolist()
-    c1, c2 = st.columns(2)
+
+    st.markdown("**🕐 Timestamps — map in process order:**")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        col_grosswt    = st.selectbox("GrossWeight",  all_cols, index=auto_index(all_cols,"GrossWeight"),  key="ob_gw")
-        col_loadingin  = st.selectbox("LoadingIn",    all_cols, index=auto_index(all_cols,"LoadingIn"),    key="ob_li")
-        col_loadingout = st.selectbox("LoadingOut",   all_cols, index=auto_index(all_cols,"LoadingOut"),   key="ob_lo")
+        col_yardin     = st.selectbox("YardIn",       all_cols, index=auto_index(all_cols,"YardIn"),      key="ob_yi")
+        col_parkin     = st.selectbox("ParkIn (fallback for YardIn)", all_cols, index=auto_index(all_cols,"ParkIn"), key="ob_pi")
     with c2:
-        col_tarewt  = st.selectbox("TareWeight",  all_cols, index=auto_index(all_cols,"TareWeight"),  key="ob_tw")
-        col_gateout = st.selectbox("GateOut",     all_cols, index=auto_index(all_cols,"GateOut"),     key="ob_go")
-    st.markdown("**Optional — YardIn & GateIn if available:**")
-    o1,o2 = st.columns(2)
-    with o1:
-        col_yardin = st.selectbox("YardIn (optional)", all_cols, index=auto_index(all_cols,"YardIn"), key="ob_yi")
-    with o2:
-        col_gatein = st.selectbox("GateIn (optional)", all_cols, index=auto_index(all_cols,"GateIn"), key="ob_gi")
+        col_yardout    = st.selectbox("YardOut",      all_cols, index=auto_index(all_cols,"YardOut"),     key="ob_yo")
+        col_parkout    = st.selectbox("ParkOut (fallback for YardOut)", all_cols, index=auto_index(all_cols,"ParkOut"), key="ob_po")
+    with c3:
+        col_gatein     = st.selectbox("GateIn",       all_cols, index=auto_index(all_cols,"GateIn"),      key="ob_gi")
+        col_grosswt    = st.selectbox("GrossWeight",  all_cols, index=auto_index(all_cols,"GrossWeight"), key="ob_gw")
+        col_loadingin  = st.selectbox("LoadingIn",    all_cols, index=auto_index(all_cols,"LoadingIn"),   key="ob_li")
+    with c4:
+        col_loadingout = st.selectbox("LoadingOut",   all_cols, index=auto_index(all_cols,"LoadingOut"),  key="ob_lo")
+        col_tarewt     = st.selectbox("TareWeight",   all_cols, index=auto_index(all_cols,"TareWeight"),  key="ob_tw")
+        col_gateout    = st.selectbox("GateOut",      all_cols, index=auto_index(all_cols,"GateOut"),     key="ob_go")
+
+    st.info("💡 **ParkIn/ParkOut** are used as fallback per row — only when YardIn/YardOut is blank for that specific row.")
 
     st.markdown("---")
     st.markdown("**🔎 Analysis Options:**")
@@ -695,7 +758,12 @@ else:
 
     if st.button("⚙️ Calculate Outbound TAT", type="primary", use_container_width=True, key="ob_calc"):
         result = df.copy()
+
+        # ── Parse all datetime columns ────────────────────────
         dt_yardin     = to_dt(result[col_yardin])     if col_yardin     != "-- Not Available --" else None
+        dt_parkin     = to_dt(result[col_parkin])     if col_parkin     != "-- Not Available --" else None
+        dt_yardout    = to_dt(result[col_yardout])    if col_yardout    != "-- Not Available --" else None
+        dt_parkout    = to_dt(result[col_parkout])    if col_parkout    != "-- Not Available --" else None
         dt_gatein     = to_dt(result[col_gatein])     if col_gatein     != "-- Not Available --" else None
         dt_grosswt    = to_dt(result[col_grosswt])    if col_grosswt    != "-- Not Available --" else None
         dt_loadingin  = to_dt(result[col_loadingin])  if col_loadingin  != "-- Not Available --" else None
@@ -703,29 +771,94 @@ else:
         dt_tarewt     = to_dt(result[col_tarewt])     if col_tarewt     != "-- Not Available --" else None
         dt_gateout    = to_dt(result[col_gateout])    if col_gateout    != "-- Not Available --" else None
 
-        st.markdown("#### 📅 DateTime Parse")
+        # ── Apply ParkIn/ParkOut fallback ROW BY ROW ──────────
+        # If YardIn is blank for a row → use ParkIn for that row
+        if dt_yardin is not None and dt_parkin is not None:
+            dt_yardin_eff = dt_yardin.fillna(dt_parkin)
+            filled_from_park = int(dt_yardin.isna().sum() - dt_yardin_eff.isna().sum())
+            if filled_from_park > 0:
+                st.info(f"💡 YardIn: **{filled_from_park} blank rows** filled using ParkIn fallback")
+        elif dt_yardin is None and dt_parkin is not None:
+            dt_yardin_eff = dt_parkin
+            st.info("💡 YardIn not mapped — using ParkIn as YardIn for all rows")
+        else:
+            dt_yardin_eff = dt_yardin
+
+        # If YardOut is blank for a row → use ParkOut for that row
+        if dt_yardout is not None and dt_parkout is not None:
+            dt_yardout_eff = dt_yardout.fillna(dt_parkout)
+            filled_from_parkout = int(dt_yardout.isna().sum() - dt_yardout_eff.isna().sum())
+            if filled_from_parkout > 0:
+                st.info(f"💡 YardOut: **{filled_from_parkout} blank rows** filled using ParkOut fallback")
+        elif dt_yardout is None and dt_parkout is not None:
+            dt_yardout_eff = dt_parkout
+            st.info("💡 YardOut not mapped — using ParkOut as YardOut for all rows")
+        else:
+            dt_yardout_eff = dt_yardout
+
+        # ── Store effective values back for Excel output ───────
+        if dt_yardin_eff is not None:
+            result["YardIn (Eff)"] = dt_yardin_eff
+        if dt_yardout_eff is not None:
+            result["YardOut (Eff)"] = dt_yardout_eff
+
+        st.markdown("#### 📅 DateTime Parse Summary")
         parse_summary([
-            ("GrossWeight",dt_grosswt,col_grosswt),("LoadingIn",dt_loadingin,col_loadingin),
-            ("LoadingOut",dt_loadingout,col_loadingout),("TareWeight",dt_tarewt,col_tarewt),
-            ("GateOut",dt_gateout,col_gateout),
+            ("YardIn*",  dt_yardin_eff,  f"{col_yardin}+ParkIn fallback"),
+            ("YardOut*", dt_yardout_eff, f"{col_yardout}+ParkOut fallback"),
+            ("GateIn",   dt_gatein,      col_gatein),
+            ("GrossWt",  dt_grosswt,     col_grosswt),
+            ("GateOut",  dt_gateout,     col_gateout),
         ], st.columns(5))
 
         st.markdown("#### ⚙️ Calculating Stages")
         stages = []
-        if dt_yardin  is not None and dt_gatein  is not None:
-            stages.append(("YI-GI",dt_yardin, dt_gatein, "YardIn",     "GateIn"))
-        if dt_gatein  is not None and dt_grosswt is not None:
-            stages.append(("GI-GW",dt_gatein, dt_grosswt,"GateIn",     "GrossWeight"))
-        stages += [
-            ("GW-LI",dt_grosswt,   dt_loadingin, "GrossWeight","LoadingIn"),
-            ("LI-LO",dt_loadingin, dt_loadingout,"LoadingIn",  "LoadingOut"),
-            ("LO-TW",dt_loadingout,dt_tarewt,    "LoadingOut", "TareWeight"),
-            ("TW-GO",dt_tarewt,    dt_gateout,   "TareWeight", "GateOut"),
-            ("GW-GO",dt_grosswt,   dt_gateout,   "GrossWeight","GateOut"),
-        ]
+
+        # YardIn* → YardOut* (YI-YO)
+        if dt_yardin_eff is not None and dt_yardout_eff is not None:
+            stages.append(("YI-YO", dt_yardin_eff, dt_yardout_eff, "YardIn*", "YardOut*"))
+
+        # YardIn* → GateIn (YI-GI)
+        if dt_yardin_eff is not None and dt_gatein is not None:
+            stages.append(("YI-GI", dt_yardin_eff, dt_gatein, "YardIn*", "GateIn"))
+
+        # YardOut* → GateIn (YO-GI)
+        if dt_yardout_eff is not None and dt_gatein is not None:
+            stages.append(("YO-GI", dt_yardout_eff, dt_gatein, "YardOut*", "GateIn"))
+
+        # GateIn → GrossWeight (GI-GW)
+        if dt_gatein is not None and dt_grosswt is not None:
+            stages.append(("GI-GW", dt_gatein, dt_grosswt, "GateIn", "GrossWeight"))
+
+        # GrossWeight → LoadingIn (GW-LI)
+        if dt_grosswt is not None and dt_loadingin is not None:
+            stages.append(("GW-LI", dt_grosswt, dt_loadingin, "GrossWeight", "LoadingIn"))
+
+        # LoadingIn → LoadingOut (LI-LO)
+        if dt_loadingin is not None and dt_loadingout is not None:
+            stages.append(("LI-LO", dt_loadingin, dt_loadingout, "LoadingIn", "LoadingOut"))
+
+        # LoadingOut → TareWeight (LO-TW)
+        if dt_loadingout is not None and dt_tarewt is not None:
+            stages.append(("LO-TW", dt_loadingout, dt_tarewt, "LoadingOut", "TareWeight"))
+
+        # TareWeight → GateOut (TW-GO)
+        if dt_tarewt is not None and dt_gateout is not None:
+            stages.append(("TW-GO", dt_tarewt, dt_gateout, "TareWeight", "GateOut"))
+
+        # GateIn → GateOut (GI-GO)
+        if dt_gatein is not None and dt_gateout is not None:
+            stages.append(("GI-GO", dt_gatein, dt_gateout, "GateIn", "GateOut"))
+
+        # GrossWeight → GateOut (GW-GO)
+        if dt_grosswt is not None and dt_gateout is not None:
+            stages.append(("GW-GO", dt_grosswt, dt_gateout, "GrossWeight", "GateOut"))
+
         result, tat_cols_set = calculate_stages(result, stages, st)
-        dt_col_names = [c for c in [col_yardin,col_gatein,col_grosswt,
-                                     col_loadingin,col_loadingout,col_tarewt,col_gateout]
+
+        dt_col_names = [c for c in [col_yardin, col_parkin, col_yardout, col_parkout,
+                                     col_gatein, col_grosswt, col_loadingin,
+                                     col_loadingout, col_tarewt, col_gateout]
                         if c != "-- Not Available --"]
         save_and_rerun(result, tat_cols_set, dt_col_names, sel_cat, total_rows, col_gateout)
 
