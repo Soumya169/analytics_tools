@@ -2,53 +2,42 @@ import streamlit as st
 import pandas as pd
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from utils import load_file, to_dt, auto_index, parse_summary, calculate_stages, hms_to_min, min_to_hms, hms_to_min_series, hms_to_excel_fraction_series
+from utils import (load_file, to_dt, auto_index, parse_summary, calculate_stages,
+                   hms_to_min, min_to_hms, hms_to_min_series, hms_to_excel_fraction_series,
+                   build_excel_multi)
 import io
+
+# ─────────────────────────────────────────────────────────────
+# HEADER-ONLY EXCEL TEMPLATE GENERATOR
+# ─────────────────────────────────────────────────────────────
+def make_header_template(headers, filename_prefix):
+    """Create a blank Excel with only header row — no data rows."""
+    import xlsxwriter
+    buf = io.BytesIO()
+    wb  = xlsxwriter.Workbook(buf)
+    ws  = wb.add_worksheet("Template")
+
+    fmt_hdr = wb.add_format({
+        'bold': True, 'font_name': 'Arial', 'font_size': 10,
+        'font_color': '#FFFFFF',
+        'bg_color': '#1F4E79' if filename_prefix == "IB" else '#833C00',
+        'align': 'center', 'valign': 'vcenter',
+        'text_wrap': True, 'border': 1
+    })
+    ws.set_row(0, 30)
+    for ci, h in enumerate(headers):
+        ws.write(0, ci, h, fmt_hdr)
+        ws.set_column(ci, ci, max(len(str(h)) + 4, 16))
+
+    wb.close()
+    buf.seek(0)
+    return buf
+
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="TAT Analysis", page_icon="📥", layout="wide")
 
-st.set_page_config(page_title="TAT Analysis", page_icon="📥", layout="wide")
-
-# ── TOP RIGHT TEMPLATE BUTTONS ─────────────────────────────
-_, col_ib, col_ob = st.columns([6, 1, 1])
-with col_ib:
-    ib_headers = ["Trip ID","Vehicle Number","Transporter Name","Shift",
-                  "Gate Entry Type","Supplier Name","Mat. Group","YardIn",
-                  "GateIn","GrossWeight","TareWeight","GateOut","Net Weight","Remarks"]
-    ib_buf = io.BytesIO()
-    with pd.ExcelWriter(ib_buf, engine='xlsxwriter') as w:
-        pd.DataFrame(columns=ib_headers).to_excel(w, index=False, sheet_name="IB Template")
-        fmt = w.book.add_format({'bold':True,'font_color':'#FFFFFF','bg_color':'#1F4E79','align':'center','border':1})
-        ws  = w.sheets["IB Template"]
-        for i,h in enumerate(ib_headers):
-            ws.write(0,i,h,fmt)
-            ws.set_column(i,i,18)
-    ib_buf.seek(0)
-    st.download_button("📥 IB Template", data=ib_buf,
-        file_name="IB_Template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="ib_tmpl_top", use_container_width=True)
-
-with col_ob:
-    ob_headers = ["Trip ID","Vehicle Number","Transporter Name","Shift",
-                  "Gate Entry Type","Supplier Name","Mat. Group","YardIn","ParkIn",
-                  "YardOut","ParkOut","GateIn","GrossWeight","LoadingIn","LoadingOut",
-                  "TareWeight","GateOut","Unloader Alias","Net Weight","Remarks"]
-    ob_buf = io.BytesIO()
-    with pd.ExcelWriter(ob_buf, engine='xlsxwriter') as w:
-        pd.DataFrame(columns=ob_headers).to_excel(w, index=False, sheet_name="OB Template")
-        fmt = w.book.add_format({'bold':True,'font_color':'#FFFFFF','bg_color':'#833C00','align':'center','border':1})
-        ws  = w.sheets["OB Template"]
-        for i,h in enumerate(ob_headers):
-            ws.write(0,i,h,fmt)
-            ws.set_column(i,i,18)
-    ob_buf.seek(0)
-    st.download_button("📤 OB Template", data=ob_buf,
-        file_name="OB_Template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="ob_tmpl_top", use_container_width=True)
 st.title("📥📤 TAT Analysis")
 st.markdown("Calculate TAT for **Inbound** and **Outbound** trips in `HH:MM:SS` format.")
 st.markdown("---")
@@ -91,15 +80,19 @@ def hms_str_to_fraction(hms_str):
         parts = str(hms_str).strip().split(":")
         if len(parts) != 3: return None
         h,m,s = int(parts[0]),int(parts[1]),int(parts[2])
-        return (h*3600 + m*60) / 86400
+        return (h*3600 + m*60 + s) / 86400
     except: return None
 
 
-def build_stats_table(result, tat_cols):
+@st.cache_data(show_spinner=False)
+def build_stats_table(result_json, tat_cols_tuple):
+    """Cached — only recomputes when data changes. Uses tuple/json for hashability."""
+    result = pd.read_json(io.StringIO(result_json))
+    tat_cols = list(tat_cols_tuple)
     rows = []
     for col in tat_cols:
         if col not in result.columns: continue
-        mins = hms_to_min_series(result[col]).dropna()   # vectorized
+        mins = hms_to_min_series(result[col]).dropna()
         if len(mins) == 0: continue
         rows.append({
             "TAT Stage":  col,
@@ -113,46 +106,31 @@ def build_stats_table(result, tat_cols):
     return pd.DataFrame(rows)
 
 
-def build_groupby_stats(result, tat_cols, group_col):
+@st.cache_data(show_spinner=False)
+def build_groupby_stats(result_json, tat_cols_tuple, group_col):
+    result = pd.read_json(io.StringIO(result_json))
+    tat_cols = list(tat_cols_tuple)
     if not group_col or group_col not in result.columns: return pd.DataFrame()
-    rows = []
-    tmp = result.copy()
+    # Compute all _min columns at once (vectorized)
+    min_cols = {}
     for col in tat_cols:
-        if col in tmp.columns:
-            tmp[col+"_min"] = hms_to_min_series(tmp[col])   # vectorized
+        if col in result.columns:
+            min_cols[col+"_min"] = hms_to_min_series(result[col])
+    tmp = pd.concat([result[[group_col]], pd.DataFrame(min_cols, index=result.index)], axis=1)
+    rows = []
     for col in tat_cols:
         mc = col+"_min"
         if mc not in tmp.columns: continue
-        grp = tmp.groupby(group_col)[mc]
-        avg,med,cnt = grp.mean(),grp.median(),grp.count()
-        for cat in avg.index:
-            rows.append({"Category":str(cat),"TAT Stage":col,
-                         "Average":min_to_hms(avg[cat]),"Median":min_to_hms(med[cat]),
-                         "Trip Count":int(cnt[cat])})
+        grp = tmp.groupby(group_col)[mc].agg(["mean","median","count"]).reset_index()
+        grp.columns = [group_col,"avg","med","cnt"]
+        for _, r in grp.iterrows():
+            rows.append({"Category":str(r[group_col]),"TAT Stage":col,
+                         "Average":min_to_hms(r["avg"]),"Median":min_to_hms(r["med"]),
+                         "Trip Count":int(r["cnt"])})
     return pd.DataFrame(rows)
 
 
-def build_time_dimension(result, tat_cols, group_col, sort_order=None):
-    """Generic: group by any time column, compute Avg/Med/Min/Max/Count per TAT stage."""
-    if group_col not in result.columns: return pd.DataFrame()
-    rows = []
-    tmp = result.copy()
-    for col in tat_cols:
-        if col in tmp.columns:
-            tmp[col+"_min"] = hms_to_min_series(tmp[col])   # vectorized
-    for col in tat_cols:
-        mc = col+"_min"
-        if mc not in tmp.columns: continue
-        grp  = tmp.groupby(group_col)[mc]
-        avg  = grp.mean(); med = grp.median()
-        mn   = grp.min();  mx  = grp.max(); cnt = grp.count()
-        keys = [k for k in (sort_order or []) if k in avg.index]
-        keys += [k for k in avg.index if k not in keys]
-        for k in keys:
-            rows.append({group_col:str(k),"TAT Stage":col,"Trip Count":int(cnt[k]),
-                         "Average":min_to_hms(avg[k]),"Median":min_to_hms(med[k]),
-                         "Min":min_to_hms(mn[k]),"Max":min_to_hms(mx[k])})
-    return pd.DataFrame(rows)
+
 
 
 def make_pivot(df, index_col, tat_cols, metric="Average"):
@@ -178,7 +156,7 @@ def show_stat_cards(stats_df):
     for i, row in stats_df.iterrows():
         with cols[i]:
             st.markdown(f"""
-            <div style='background:#1F4E79;padding:12px;border-radius:10px;
+            <div style='background:#2C3E50;padding:12px;border-radius:10px;
                         text-align:center;margin-bottom:6px'>
                 <div style='color:#BDD7EE;font-size:10px;text-transform:uppercase;
                             letter-spacing:1px'>{row['TAT Stage']}</div>
@@ -186,7 +164,7 @@ def show_stat_cards(stats_df):
                             margin:4px 0'>{row['Average']}</div>
                 <div style='color:#94a3b8;font-size:10px'>Average</div>
             </div>
-            <div style='background:#375623;padding:12px;border-radius:10px;text-align:center'>
+            <div style='background:#2C3E50;padding:12px;border-radius:10px;text-align:center'>
                 <div style='color:#E2EFDA;font-size:10px;text-transform:uppercase;
                             letter-spacing:1px'>{row['TAT Stage']}</div>
                 <div style='color:#10b981;font-size:18px;font-weight:700;
@@ -215,21 +193,21 @@ def render_cards(df, label_col, stage_filter=None):
         if i >= n: break
         with day_cols[i]:
             st.markdown(f"""
-            <div style='background:#833C00;padding:8px;border-radius:8px;
+            <div style='background:#2C3E50;padding:8px;border-radius:8px;
                         text-align:center;margin-bottom:4px'>
                 <div style='color:#FCE4D6;font-size:9px;font-weight:700'>{row[label_col]}</div>
             </div>
-            <div style='background:#1F4E79;padding:7px;border-radius:7px;
+            <div style='background:#34495E;padding:7px;border-radius:7px;
                         text-align:center;margin-bottom:3px'>
                 <div style='color:#BDD7EE;font-size:9px'>Avg</div>
                 <div style='color:#00d4ff;font-size:12px;font-weight:700'>{row['Average']}</div>
             </div>
-            <div style='background:#375623;padding:7px;border-radius:7px;
+            <div style='background:#34495E;padding:7px;border-radius:7px;
                         text-align:center;margin-bottom:3px'>
                 <div style='color:#E2EFDA;font-size:9px'>Median</div>
                 <div style='color:#10b981;font-size:12px;font-weight:700'>{row['Median']}</div>
             </div>
-            <div style='background:#243F60;padding:5px;border-radius:7px;text-align:center'>
+            <div style='background:#2C3E50;padding:5px;border-radius:7px;text-align:center'>
                 <div style='color:#BDD7EE;font-size:9px'>Trips</div>
                 <div style='color:white;font-size:12px;font-weight:700'>{row['Trip Count']}</div>
             </div>""", unsafe_allow_html=True)
@@ -245,7 +223,7 @@ def format_stats_sheet(ws, max_row):
                 frac = hms_str_to_fraction(cell.value)
                 if frac is not None:
                     cell.value = frac
-                    cell.number_format = "[HH]:MM:SS"
+                    cell.number_format = "[hh]:mm"
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
@@ -327,7 +305,7 @@ def export_excel(result, stats_df, groupby_df, time_data, dt_col_names, tat_cols
                 for rn in range(2, len(result_out)+2):
                     cell = ws_full[f"{cl}{rn}"]
                     if cell.value and not isinstance(cell.value, str):
-                        cell.number_format = "DD-MM-YYYY HH:MM"
+                        cell.number_format = "DD-MM-YYYY HH:MM:SS"
 
         # TAT columns → already fractions, just apply format + style
         for col_name in tat_cols_set:
@@ -339,7 +317,7 @@ def export_excel(result, stats_df, groupby_df, time_data, dt_col_names, tat_cols
                 for rn in range(2, len(result_out)+2):
                     cell = ws_full[f"{cl}{rn}"]
                     if cell.value not in (None,""):
-                        cell.number_format = "[HH]:MM:SS"
+                        cell.number_format = "[hh]:mm"
                     cell.fill = PatternFill("solid", start_color="E2EFDA")
                     cell.font = Font(name="Arial",size=9,bold=True,color="375623")
 
@@ -585,11 +563,38 @@ def save_and_rerun(result, tat_cols_set, dt_col_names, sel_cat, total_rows, gate
         time_data["month_df"] = build_time_dimension(
             result, tat_cols, "GateOut Month", sort_order=MONTH_ORDER)
 
+    # Serialize to JSON once — cached functions reuse it
+    with st.spinner("⚙️ Computing statistics..."):
+        result_json = result.to_json()
+        tat_tuple   = tuple(sorted(tat_cols))
+
+        stats       = build_stats_table(result_json, tat_tuple)
+        groupby     = (build_groupby_stats(result_json, tat_tuple, sel_cat)
+                       if sel_cat != "-- None --" else pd.DataFrame())
+
+        # Time dimensions — all computed in parallel-ish via cached calls
+        time_data_final = {}
+        if "GateOut Date" in result.columns:
+            time_data_final["date_df"] = build_time_dimension(
+                result_json, tat_tuple, "GateOut Date")
+        if "GateOut DayOfWeek" in result.columns:
+            time_data_final["dayofwk_df"] = build_time_dimension(
+                result_json, tat_tuple, "GateOut DayOfWeek",
+                sort_order_tuple=tuple(WEEKDAY_ORDER))
+        if "GateOut WeekNo" in result.columns:
+            all_weeks = tuple(sorted(result["GateOut WeekNo"].dropna().unique().tolist()))
+            time_data_final["week_df"] = build_time_dimension(
+                result_json, tat_tuple, "GateOut WeekNo",
+                sort_order_tuple=all_weeks)
+        if "GateOut Month" in result.columns:
+            time_data_final["month_df"] = build_time_dimension(
+                result_json, tat_tuple, "GateOut Month",
+                sort_order_tuple=tuple(MONTH_ORDER))
+
     st.session_state["tat_result"]      = result
-    st.session_state["tat_stats"]       = build_stats_table(result, tat_cols)
-    st.session_state["tat_groupby"]     = (build_groupby_stats(result, tat_cols, sel_cat)
-                                            if sel_cat != "-- None --" else pd.DataFrame())
-    st.session_state["tat_time_data"]   = time_data
+    st.session_state["tat_stats"]       = stats
+    st.session_state["tat_groupby"]     = groupby
+    st.session_state["tat_time_data"]   = time_data_final
     st.session_state["tat_dt_cols"]     = dt_col_names
     st.session_state["tat_tat_set"]     = tat_cols_set
     st.session_state["tat_total"]       = total_rows
@@ -648,6 +653,22 @@ if mode == "inbound":
     sel_cat = st.selectbox("📂 Group-by Category (optional)", cat_found, key="ib_cat")
     st.session_state["tat_sel_cat"] = sel_cat
     st.info("📅 Auto-added columns: **GateOut Date · GateOut DayOfWeek · GateOut WeekNo · GateOut Month**")
+    st.markdown("---")
+
+
+    # ── INBOUND TEMPLATE DOWNLOAD ─────────────────────────────
+    with st.expander("📥 Download Blank IB Template (Headers Only)"):
+        ib_headers = ['Trip ID', 'Vehicle Number', 'Transporter Name', 'Shift', 'Gate Entry Type', 'Supplier Name', 'Mat. Group', 'YardIn', 'GateIn', 'GrossWeight', 'TareWeight', 'GateOut', 'Net Weight', 'Remarks']
+        ib_buf = make_header_template(ib_headers, "IB")
+        st.caption("Click below to download a blank Inbound Excel template with all required headers.")
+        st.download_button(
+            label="⬇️ Download IB Header Template",
+            data=ib_buf,
+            file_name="IB_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="ib_template_dl",
+            use_container_width=True
+        )
     st.markdown("---")
 
     if st.button("⚙️ Calculate Inbound TAT", type="primary", use_container_width=True, key="ib_calc"):
@@ -756,6 +777,22 @@ else:
     st.info("📅 Auto-added columns: **GateOut Date · GateOut DayOfWeek · GateOut WeekNo · GateOut Month**")
     st.markdown("---")
 
+
+    # ── OUTBOUND TEMPLATE DOWNLOAD ────────────────────────────
+    with st.expander("📤 Download Blank OB Template (Headers Only)"):
+        ob_headers = ['Trip ID', 'Vehicle Number', 'Transporter Name', 'Shift', 'Gate Entry Type', 'Supplier Name', 'Mat. Group', 'YardIn', 'ParkIn', 'YardOut', 'ParkOut', 'GateIn', 'GrossWeight', 'LoadingIn', 'LoadingOut', 'TareWeight', 'GateOut', 'Unloader Alias', 'Net Weight', 'Remarks']
+        ob_buf = make_header_template(ob_headers, "OB")
+        st.caption("Click below to download a blank Outbound Excel template with all required headers.")
+        st.download_button(
+            label="⬇️ Download OB Header Template",
+            data=ob_buf,
+            file_name="OB_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="ob_template_dl",
+            use_container_width=True
+        )
+    st.markdown("---")
+
     if st.button("⚙️ Calculate Outbound TAT", type="primary", use_container_width=True, key="ob_calc"):
         result = df.copy()
 
@@ -830,21 +867,25 @@ else:
         if dt_gatein is not None and dt_grosswt is not None:
             stages.append(("GI-GW", dt_gatein, dt_grosswt, "GateIn", "GrossWeight"))
 
-        # GrossWeight → LoadingIn (GW-LI)
-        if dt_grosswt is not None and dt_loadingin is not None:
-            stages.append(("GW-LI", dt_grosswt, dt_loadingin, "GrossWeight", "LoadingIn"))
+        # GateIn → TareWeight (GI-TW)
+        if dt_gatein is not None and dt_tarewt is not None:
+            stages.append(("GI-TW", dt_gatein, dt_tarewt, "GateIn", "TareWeight"))
+
+        # TareWeight → LoadingIn (TW-LI)
+        if dt_tarewt is not None and dt_loadingin is not None:
+            stages.append(("TW-LI", dt_tarewt, dt_loadingin, "TareWeight", "LoadingIn"))
 
         # LoadingIn → LoadingOut (LI-LO)
         if dt_loadingin is not None and dt_loadingout is not None:
             stages.append(("LI-LO", dt_loadingin, dt_loadingout, "LoadingIn", "LoadingOut"))
 
-        # LoadingOut → TareWeight (LO-TW)
-        if dt_loadingout is not None and dt_tarewt is not None:
-            stages.append(("LO-TW", dt_loadingout, dt_tarewt, "LoadingOut", "TareWeight"))
+        # LoadingOut → GrossWeight (LO-GW)
+        if dt_loadingout is not None and dt_grosswt is not None:
+            stages.append(("LO-GW", dt_loadingout, dt_grosswt, "LoadingOut", "GrossWeight"))
 
-        # TareWeight → GateOut (TW-GO)
-        if dt_tarewt is not None and dt_gateout is not None:
-            stages.append(("TW-GO", dt_tarewt, dt_gateout, "TareWeight", "GateOut"))
+        # GrossWeight → GateOut (GW-GO)
+        if dt_grosswt is not None and dt_gateout is not None:
+            stages.append(("GW-GO", dt_grosswt, dt_gateout, "GrossWeight", "GateOut"))
 
         # GateIn → GateOut (GI-GO)
         if dt_gatein is not None and dt_gateout is not None:
