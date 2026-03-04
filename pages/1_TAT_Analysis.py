@@ -327,7 +327,7 @@ def export_excel(result, stats_df, groupby_df, time_data, dt_col_names, tat_cols
                 for rn in range(2, len(result_out)+2):
                     cell = ws_full[f"{cl}{rn}"]
                     if cell.value and not isinstance(cell.value, str):
-                        cell.number_format = "DD-MM-YYYY HH:MM:SS"
+                        cell.number_format = "DD-MM-YYYY HH:MM"
 
         # TAT columns → already fractions, just apply format + style
         for col_name in tat_cols_set:
