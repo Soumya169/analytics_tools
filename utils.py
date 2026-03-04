@@ -132,10 +132,13 @@ def build_excel_multi(sheets_dict, tat_cols_set=None, dt_col_names=None):
                 df_fd[col] = hms_to_excel_fraction_series(df_fd[col])
         for col in dt_col_names:
             if col in df_fd.columns:
-                df_fd[col] = pd.to_datetime(
+                converted = pd.to_datetime(
                     df_fd[col].replace("", pd.NaT),
                     dayfirst=True, errors='coerce'
-                ).dt.to_pydatetime()
+                )
+                # Replace NaT with None so xlsxwriter doesn't crash
+                df_fd[col] = [None if pd.isnull(v) else v.to_pydatetime()
+                               for v in converted]
         sheets_dict["Full Data"] = df_fd
 
     TIME_STAT_COLS = {"Average", "Median", "Min", "Max"}
@@ -233,6 +236,12 @@ def build_excel_multi(sheets_dict, tat_cols_set=None, dt_col_names=None):
                             val  = (mins * 60 / 86400) if mins is not None else None
                         ws.write(rn, ci, val, fmt_time_val)
                     elif cn in dt_col_names:
+                        # Convert NaT/NaN to None — xlsxwriter cannot handle NaT
+                        try:
+                            if val is None or pd.isnull(val):
+                                val = None
+                        except Exception:
+                            pass
                         ws.write(rn, ci, val, fmt_dt)
                     else:
                         ws.write(rn, ci, val, base)
